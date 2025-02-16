@@ -522,215 +522,421 @@ bool poseNet::Process( void* input, uint32_t width, uint32_t height, imageFormat
 	return true;
 }
 
-
-// Process
-bool poseNet::Process( void* input, uint32_t width, uint32_t height, imageFormat format, uint32_t overlay )
-{
-	std::vector<ObjectPose> poses;
-	return Process(input, width, height, format, poses, overlay);
-}
-
-
-// postProcess
 bool poseNet::postProcess(std::vector<ObjectPose>& poses, uint32_t width, uint32_t height)
 {
-	float* cmap = mOutputs[0].CPU;
-	float* paf = mOutputs[1].CPU;
+    float* cmap = mOutputs[0].CPU;
+    float* paf = mOutputs[1].CPU;
 
-	// https://github.com/NVIDIA-AI-IOT/trt_pose/tree/master/trt_pose/parse#terminology
-	const int C = DIMS_C(mOutputs[0].dims);
-	const int H = DIMS_H(mOutputs[0].dims);
-	const int W = DIMS_W(mOutputs[0].dims);
-	const int K = mTopology.numLinks;
-	const int M = MAX_LINKS;
-	const int N = 1;  // batch size = 1
-	
-	//LogVerbose("cmap C=%i H=%i W=%i\n", C, H, W);
-	//LogVerbose("paf  C=%i H=%i W=%i\n", DIMS_C(mOutputs[1].dims), DIMS_H(mOutputs[1].dims), DIMS_W(mOutputs[1].dims));
-	
-	// find peaks
-	trt_pose::parse::find_peaks_out_nchw(
-		mPeakCounts, mPeaks, cmap,
-		N, C, H, W, M,
-		mThreshold, CMAP_WINDOW_SIZE);
-		
-	// refine peaks
-	trt_pose::parse::refine_peaks_out_nchw(
-		mRefinedPeaks, mPeakCounts, mPeaks, cmap,
-		N, C, H, W, M, CMAP_WINDOW_SIZE);
-	
-	// compute score graph
-	trt_pose::parse::paf_score_graph_out_nkhw(
-		mScoreGraph, mTopology.links, 
-		paf, mPeakCounts, mRefinedPeaks,
-		N, K, C, H, W, M,
-		PAF_INTEGRAL_SAMPLES);
-	
-	// generate connections
-	memset(mConnections, -1, K * M * 2 * sizeof(int));
-	memset(mObjects, -1, MAX_OBJECTS * C * sizeof(int));
-	
-	trt_pose::parse::assignment_out_nk(
-		mConnections, mScoreGraph, mTopology.links, mPeakCounts,
-		N, C, K, M, mThreshold, mAssignmentWorkspace);
-		
-	trt_pose::parse::connect_parts_out_batch(
-		&mNumObjects, mObjects, mConnections, mTopology.links, mPeakCounts,
-		N, K, C, M, MAX_OBJECTS, mConnectionWorkspace);
-		
-	// collate results
-	for( int i=0; i < mNumObjects; i++ )
-	{
-		ObjectPose obj_pose;
-		
-		obj_pose.ID     = i;
-		obj_pose.Left   = 9999999;
-		obj_pose.Top    = 9999999;
-		obj_pose.Right  = 0;
-		obj_pose.Bottom = 0;
-		
-		// add valid keypoints
-		for( int j=0; j < C; j++ )
-		{
-			const int k = mObjects[i * C + j];
+    const int C = DIMS_C(mOutputs[0].dims);  // Number of keypoints
+    const int H = DIMS_H(mOutputs[0].dims);  // Heatmap height
+    const int W = DIMS_W(mOutputs[0].dims);  // Heatmap width
+    const int K = mTopology.numLinks;        // Number of keypoint connections (links)
+    const int M = MAX_LINKS;
+    const int N = 1;  // Batch size = 1
+    
+    // Find peaks (detect keypoints)
+    trt_pose::parse::find_peaks_out_nchw(
+        mPeakCounts, mPeaks, cmap,
+        N, C, H, W, M,
+        mThreshold, CMAP_WINDOW_SIZE);
+        
+    // Refine keypoints
+    trt_pose::parse::refine_peaks_out_nchw(
+        mRefinedPeaks, mPeakCounts, mPeaks, cmap,
+        N, C, H, W, M, CMAP_WINDOW_SIZE);
+    
+    // Compute part affinity field (PAF) score graph
+    trt_pose::parse::paf_score_graph_out_nkhw(
+        mScoreGraph, mTopology.links, 
+        paf, mPeakCounts, mRefinedPeaks,
+        N, K, C, H, W, M,
+        PAF_INTEGRAL_SAMPLES);
+    
+    // Generate connections
+    memset(mConnections, -1, K * M * 2 * sizeof(int));
+    memset(mObjects, -1, MAX_OBJECTS * C * sizeof(int));
+    
+    trt_pose::parse::assignment_out_nk(
+        mConnections, mScoreGraph, mTopology.links, mPeakCounts,
+        N, C, K, M, mThreshold, mAssignmentWorkspace);
+        
+    trt_pose::parse::connect_parts_out_batch(
+        &mNumObjects, mObjects, mConnections, mTopology.links, mPeakCounts,
+        N, K, C, M, MAX_OBJECTS, mConnectionWorkspace);
+        
+    // Process detected objects
+    for (int i = 0; i < mNumObjects; i++)
+    {
+        ObjectPose obj_pose;
 
-			if( k >= 0 )
-			{
-				const int peak_idx = j * M * 2 + k * 2;
-				
-				ObjectPose::Keypoint keypoint;
-				
-				keypoint.ID = j;
-				keypoint.x  = mRefinedPeaks[peak_idx + 1] * width;
-				keypoint.y  = mRefinedPeaks[peak_idx + 0] * height;
-				
-				obj_pose.Keypoints.push_back(keypoint);
-			}
-		}
-			
-		// add valid links
-		for( int k=0; k < K; k++ )
-		{
-			const int c_a = mTopology.links[k * 4 + 2];
-			const int c_b = mTopology.links[k * 4 + 3];
-			
-			const int obj_a = mObjects[i * C + c_a];
-			const int obj_b = mObjects[i * C + c_b];
-			
-			if( obj_a >= 0 && obj_b >= 0 )
-			{
-				int a = obj_pose.FindKeypoint(c_a);
-				int b = obj_pose.FindKeypoint(c_b);
-				
-				if( a < 0 || b < 0 )
-				{
-					LogError(LOG_TRT "poseNet::postProcess() -- missing keypoint in output object pose, skipping...\n");
-					continue;
-				}
-				
-				const int link_idx = obj_pose.FindLink(a,b);
-				
-				if( link_idx >= 0 )
-				{
-					LogWarning(LOG_TRT "poseNet::postProcess() -- duplicate link detected, skipping...\n");
-					continue;
-				}
-				
-				if( a > b )
-				{
-					const int c = a;
-					a = b;
-					b = c;
-				}
-				
-				obj_pose.Links.push_back({(uint32_t)a, (uint32_t)b});
-			}
-		}
-		
-		// get bounding box
-		const uint32_t numKeypoints = obj_pose.Keypoints.size();
-		
-		if( numKeypoints < 2 )
-			continue;
-		
-		for( uint32_t n=0; n < numKeypoints; n++ )
-		{
-			obj_pose.Left   = MIN(obj_pose.Keypoints[n].x, obj_pose.Left);
-			obj_pose.Top    = MIN(obj_pose.Keypoints[n].y, obj_pose.Top);
-			obj_pose.Right  = MAX(obj_pose.Keypoints[n].x, obj_pose.Right);
-			obj_pose.Bottom = MAX(obj_pose.Keypoints[n].y, obj_pose.Bottom);
-		}
-		
-		poses.push_back(obj_pose);
-	}
-	
-	return true;
+        obj_pose.ID     = i;
+        obj_pose.Left   = FLT_MAX;  // Initialize with large values
+        obj_pose.Top    = FLT_MAX;
+        obj_pose.Right  = 0;
+        obj_pose.Bottom = 0;
+
+        // Add valid keypoints
+        for (int j = 0; j < C; j++)
+        {
+            const int k = mObjects[i * C + j];
+
+            if (k >= 0)
+            {
+                const int peak_idx = j * M * 2 + k * 2;
+                
+                ObjectPose::Keypoint keypoint;
+                keypoint.ID = j;
+                keypoint.x  = mRefinedPeaks[peak_idx + 1] * width;
+                keypoint.y  = mRefinedPeaks[peak_idx + 0] * height;
+                
+                obj_pose.Keypoints.push_back(keypoint);
+            }
+        }
+        
+        // Add valid links (restore skeleton connections)
+        for (int k = 0; k < K; k++)
+        {
+            const int c_a = mTopology.links[k * 4 + 2];
+            const int c_b = mTopology.links[k * 4 + 3];
+
+            const int obj_a = mObjects[i * C + c_a];
+            const int obj_b = mObjects[i * C + c_b];
+
+            if (obj_a >= 0 && obj_b >= 0)
+            {
+                int a = obj_pose.FindKeypoint(c_a);
+                int b = obj_pose.FindKeypoint(c_b);
+
+                if (a < 0 || b < 0)
+                {
+                    LogError(LOG_TRT "poseNet::postProcess() -- missing keypoint in output object pose, skipping...\n");
+                    continue;
+                }
+
+                if (a > b)
+                {
+                    const int c = a;
+                    a = b;
+                    b = c;
+                }
+
+                obj_pose.Links.push_back({(uint32_t)a, (uint32_t)b});
+            }
+        }
+
+        // Get bounding box (expand it for full human body coverage)
+        const uint32_t numKeypoints = obj_pose.Keypoints.size();
+
+        if (numKeypoints < 2)
+            continue;
+
+        for (uint32_t n = 0; n < numKeypoints; n++)
+        {
+            obj_pose.Left   = std::min(obj_pose.Left, obj_pose.Keypoints[n].x);
+            obj_pose.Top    = std::min(obj_pose.Top, obj_pose.Keypoints[n].y);
+            obj_pose.Right  = std::max(obj_pose.Right, obj_pose.Keypoints[n].x);
+            obj_pose.Bottom = std::max(obj_pose.Bottom, obj_pose.Keypoints[n].y);
+        }
+
+        // Apply padding to capture full body (expands bbox)
+        const float paddingX = (obj_pose.Right - obj_pose.Left) * 0.15f;  // 15% width padding
+        const float paddingY = (obj_pose.Bottom - obj_pose.Top) * 200.0f;  // 20% height padding
+
+        obj_pose.Left   = std::max(0.0f, obj_pose.Left - paddingX);
+        obj_pose.Top    = std::max(0.0f, obj_pose.Top - paddingY);
+        obj_pose.Right  = std::min(static_cast<float>(width), obj_pose.Right + paddingX);
+        obj_pose.Bottom = std::min(static_cast<float>(height), obj_pose.Bottom + paddingY);
+
+		if(obj_pose.Top>50)
+			obj_pose.Top -=50;
+		else
+			obj_pose.Top = std::max(0.0f, obj_pose.Top - (paddingY * 1.5f)
+
+        poses.push_back(obj_pose);
+    }
+    
+    return true;
 }
 
 
-// Overlay
-bool poseNet::Overlay( void* input, void* output, uint32_t width, uint32_t height, imageFormat format, const std::vector<ObjectPose>& poses, uint32_t overlay )
+// Process
+// bool poseNet::Process( void* input, uint32_t width, uint32_t height, imageFormat format, uint32_t overlay )
+// {
+// 	std::vector<ObjectPose> poses;
+// 	return Process(input, width, height, format, poses, overlay);
+// }
+
+
+// // postProcess
+// bool poseNet::postProcess(std::vector<ObjectPose>& poses, uint32_t width, uint32_t height)
+// {
+// 	float* cmap = mOutputs[0].CPU;
+// 	float* paf = mOutputs[1].CPU;
+
+// 	// https://github.com/NVIDIA-AI-IOT/trt_pose/tree/master/trt_pose/parse#terminology
+// 	const int C = DIMS_C(mOutputs[0].dims);
+// 	const int H = DIMS_H(mOutputs[0].dims);
+// 	const int W = DIMS_W(mOutputs[0].dims);
+// 	const int K = mTopology.numLinks;
+// 	const int M = MAX_LINKS;
+// 	const int N = 1;  // batch size = 1
+	
+// 	//LogVerbose("cmap C=%i H=%i W=%i\n", C, H, W);
+// 	//LogVerbose("paf  C=%i H=%i W=%i\n", DIMS_C(mOutputs[1].dims), DIMS_H(mOutputs[1].dims), DIMS_W(mOutputs[1].dims));
+	
+// 	// find peaks
+// 	trt_pose::parse::find_peaks_out_nchw(
+// 		mPeakCounts, mPeaks, cmap,
+// 		N, C, H, W, M,
+// 		mThreshold, CMAP_WINDOW_SIZE);
+		
+// 	// refine peaks
+// 	trt_pose::parse::refine_peaks_out_nchw(
+// 		mRefinedPeaks, mPeakCounts, mPeaks, cmap,
+// 		N, C, H, W, M, CMAP_WINDOW_SIZE);
+	
+// 	// compute score graph
+// 	trt_pose::parse::paf_score_graph_out_nkhw(
+// 		mScoreGraph, mTopology.links, 
+// 		paf, mPeakCounts, mRefinedPeaks,
+// 		N, K, C, H, W, M,
+// 		PAF_INTEGRAL_SAMPLES);
+	
+// 	// generate connections
+// 	memset(mConnections, -1, K * M * 2 * sizeof(int));
+// 	memset(mObjects, -1, MAX_OBJECTS * C * sizeof(int));
+	
+// 	trt_pose::parse::assignment_out_nk(
+// 		mConnections, mScoreGraph, mTopology.links, mPeakCounts,
+// 		N, C, K, M, mThreshold, mAssignmentWorkspace);
+		
+// 	trt_pose::parse::connect_parts_out_batch(
+// 		&mNumObjects, mObjects, mConnections, mTopology.links, mPeakCounts,
+// 		N, K, C, M, MAX_OBJECTS, mConnectionWorkspace);
+		
+// 	// collate results
+// 	for( int i=0; i < mNumObjects; i++ )
+// 	{
+// 		ObjectPose obj_pose;
+		
+// 		obj_pose.ID     = i;
+// 		obj_pose.Left   = 9999999;
+// 		obj_pose.Top    = 9999999;
+// 		obj_pose.Right  = 0;
+// 		obj_pose.Bottom = 0;
+		
+// 		// add valid keypoints
+// 		for( int j=0; j < C; j++ )
+// 		{
+// 			const int k = mObjects[i * C + j];
+
+// 			if( k >= 0 )
+// 			{
+// 				const int peak_idx = j * M * 2 + k * 2;
+				
+// 				ObjectPose::Keypoint keypoint;
+				
+// 				keypoint.ID = j;
+// 				keypoint.x  = mRefinedPeaks[peak_idx + 1] * width;
+// 				keypoint.y  = mRefinedPeaks[peak_idx + 0] * height;
+				
+// 				obj_pose.Keypoints.push_back(keypoint);
+// 			}
+// 		}
+			
+// 		// add valid links
+// 		for( int k=0; k < K; k++ )
+// 		{
+// 			const int c_a = mTopology.links[k * 4 + 2];
+// 			const int c_b = mTopology.links[k * 4 + 3];
+			
+// 			const int obj_a = mObjects[i * C + c_a];
+// 			const int obj_b = mObjects[i * C + c_b];
+			
+// 			if( obj_a >= 0 && obj_b >= 0 )
+// 			{
+// 				int a = obj_pose.FindKeypoint(c_a);
+// 				int b = obj_pose.FindKeypoint(c_b);
+				
+// 				if( a < 0 || b < 0 )
+// 				{
+// 					LogError(LOG_TRT "poseNet::postProcess() -- missing keypoint in output object pose, skipping...\n");
+// 					continue;
+// 				}
+				
+// 				const int link_idx = obj_pose.FindLink(a,b);
+				
+// 				if( link_idx >= 0 )
+// 				{
+// 					LogWarning(LOG_TRT "poseNet::postProcess() -- duplicate link detected, skipping...\n");
+// 					continue;
+// 				}
+				
+// 				if( a > b )
+// 				{
+// 					const int c = a;
+// 					a = b;
+// 					b = c;
+// 				}
+				
+// 				obj_pose.Links.push_back({(uint32_t)a, (uint32_t)b});
+// 			}
+// 		}
+		
+// 		// get bounding box
+// 		const uint32_t numKeypoints = obj_pose.Keypoints.size();
+		
+// 		if( numKeypoints < 2 )
+// 			continue;
+		
+// 		for( uint32_t n=0; n < numKeypoints; n++ )
+// 		{
+// 			obj_pose.Left   = MIN(obj_pose.Keypoints[n].x, obj_pose.Left);
+// 			obj_pose.Top    = MIN(obj_pose.Keypoints[n].y, obj_pose.Top);
+// 			obj_pose.Right  = MAX(obj_pose.Keypoints[n].x, obj_pose.Right);
+// 			obj_pose.Bottom = MAX(obj_pose.Keypoints[n].y, obj_pose.Bottom);
+// 		}
+		
+// 		poses.push_back(obj_pose);
+// 	}
+	
+// 	return true;
+// }
+
+bool poseNet::Overlay( void* input, void* output, uint32_t width, uint32_t height, 
+                       imageFormat format, const std::vector<ObjectPose>& poses, uint32_t overlay )
 {
-	if( !input || !output || width == 0 || height == 0 )
-		return false;
-	
-	if( overlay == OVERLAY_NONE )
-		return true;
-	
-	if( input != output )
-	{
-		if( CUDA_FAILED(cudaMemcpy(output, input, imageFormatSize(format, width, height), cudaMemcpyDeviceToDevice)) )
-		{
-			LogError(LOG_TRT "poseNet -- Overlay() failed to copy input image to output image\n");
-			return false;
-		}
-	}
-	
-	const uint32_t numObjects = poses.size();
-	
-	const float line_width = MAX(MAX(width,height) * mLinkScale, 1.5f);
-	const float circle_radius = MAX(MAX(width,height) * mKeypointScale, 4.0f);
-	
-	for( uint32_t o=0; o < numObjects; o++ )
-	{
+    if( !input || !output || width == 0 || height == 0 )
+        return false;
+    
+    if( overlay == OVERLAY_NONE )
+        return true;
+
+    // Ensure the output image is correctly copied
+    if( input != output )
+    {
+        if( CUDA_FAILED(cudaMemcpy(output, input, imageFormatSize(format, width, height), cudaMemcpyDeviceToDevice)) )
+        {
+            LogError(LOG_TRT "poseNet -- Overlay() failed to copy input image to output image\n");
+            return false;
+        }
+    }
+    
+    const uint32_t numObjects = poses.size();
+    
+    // Scaling factors for link thickness and keypoint size
+    const float line_width = MAX(MAX(width,height) * mLinkScale, 1.5f);
+    const float circle_radius = MAX(MAX(width,height) * mKeypointScale, 4.0f);
+    
+    for( uint32_t o=0; o < numObjects; o++ )
+    {
+        // ✅ Draw Bounding Box (Even if Only Keypoints are Enabled)
+        
+        
+		// ✅ Draw Bounding Box (Always When Keypoints Are Enabled)
 		if( overlay & OVERLAY_BOX )
 		{
 			CUDA(cudaDrawRect(input, output, width, height, format,
-						   poses[o].Left, poses[o].Top, poses[o].Right, poses[o].Bottom,
-						   make_float4(255, 255, 255, 100)));
+						poses[o].Left, poses[o].Top, poses[o].Right, poses[o].Bottom,
+						make_float4(255, 255, 255, 200)));  // White Box with slight transparency
 		}
-		
+
+		// ✅ Draw Skeleton Links (Ensure Connections Between Keypoints)
 		if( overlay & OVERLAY_LINKS )
 		{
 			const uint32_t numLinks = poses[o].Links.size();
-			
-			for( uint32_t l=0; l < numLinks; l++ )
+
+			for( uint32_t l = 0; l < numLinks; l++ )
 			{
 				const uint32_t a = poses[o].Links[l][0];
 				const uint32_t b = poses[o].Links[l][1];
-				
+
 				CUDA(cudaDrawLine(input, output, width, height, format, 
-							   poses[o].Keypoints[a].x, poses[o].Keypoints[a].y, 
-							   poses[o].Keypoints[b].x, poses[o].Keypoints[b].y,
-							   mKeypointColors[poses[o].Keypoints[b].ID], line_width));
+								poses[o].Keypoints[a].x, poses[o].Keypoints[a].y, 
+								poses[o].Keypoints[b].x, poses[o].Keypoints[b].y,
+								mKeypointColors[poses[o].Keypoints[b].ID], line_width));
 			}
 		}
-		
+
+		// ✅ Draw Keypoints (Joints)
 		if( overlay & OVERLAY_KEYPOINTS )
 		{
 			const uint32_t numKeypoints = poses[o].Keypoints.size();
-						
-			for( uint32_t k=0; k < numKeypoints; k++ )
+
+			for( uint32_t k = 0; k < numKeypoints; k++ )
 			{
 				CUDA(cudaDrawCircle(input, output, width, height, format, 
-								poses[o].Keypoints[k].x, poses[o].Keypoints[k].y, 
-								circle_radius, mKeypointColors[poses[o].Keypoints[k].ID]));
+									poses[o].Keypoints[k].x, poses[o].Keypoints[k].y, 
+									circle_radius, mKeypointColors[poses[o].Keypoints[k].ID]));
 			}
 		}
-	}
-	
-	return true;
+    
+    return true;
 }
+
+// // Overlay
+// bool poseNet::Overlay( void* input, void* output, uint32_t width, uint32_t height, imageFormat format, const std::vector<ObjectPose>& poses, uint32_t overlay )
+// {
+// 	if( !input || !output || width == 0 || height == 0 )
+// 		return false;
+	
+// 	if( overlay == OVERLAY_NONE )
+// 		return true;
+	
+// 	if( input != output )
+// 	{
+// 		if( CUDA_FAILED(cudaMemcpy(output, input, imageFormatSize(format, width, height), cudaMemcpyDeviceToDevice)) )
+// 		{
+// 			LogError(LOG_TRT "poseNet -- Overlay() failed to copy input image to output image\n");
+// 			return false;
+// 		}
+// 	}
+	
+// 	const uint32_t numObjects = poses.size();
+	
+// 	const float line_width = MAX(MAX(width,height) * mLinkScale, 1.5f);
+// 	const float circle_radius = MAX(MAX(width,height) * mKeypointScale, 4.0f);
+	
+// 	for( uint32_t o=0; o < numObjects; o++ )
+// 	{
+// 		if( overlay & OVERLAY_BOX )
+// 		{
+// 			CUDA(cudaDrawRect(input, output, width, height, format,
+// 						   poses[o].Left, poses[o].Top, poses[o].Right, poses[o].Bottom,
+// 						   make_float4(255, 255, 255, 100)));
+// 		}
+		
+// 		if( overlay & OVERLAY_LINKS )
+// 		{
+// 			const uint32_t numLinks = poses[o].Links.size();
+			
+// 			for( uint32_t l=0; l < numLinks; l++ )
+// 			{
+// 				const uint32_t a = poses[o].Links[l][0];
+// 				const uint32_t b = poses[o].Links[l][1];
+				
+// 				CUDA(cudaDrawLine(input, output, width, height, format, 
+// 							   poses[o].Keypoints[a].x, poses[o].Keypoints[a].y, 
+// 							   poses[o].Keypoints[b].x, poses[o].Keypoints[b].y,
+// 							   mKeypointColors[poses[o].Keypoints[b].ID], line_width));
+// 			}
+// 		}
+		
+// 		if( overlay & OVERLAY_KEYPOINTS )
+// 		{
+// 			const uint32_t numKeypoints = poses[o].Keypoints.size();
+						
+// 			for( uint32_t k=0; k < numKeypoints; k++ )
+// 			{
+// 				CUDA(cudaDrawCircle(input, output, width, height, format, 
+// 								poses[o].Keypoints[k].x, poses[o].Keypoints[k].y, 
+// 								circle_radius, mKeypointColors[poses[o].Keypoints[k].ID]));
+// 			}
+// 		}
+// 	}
+	
+// 	return true;
+// }
 
 
 // OverlayFlagsFromStr
